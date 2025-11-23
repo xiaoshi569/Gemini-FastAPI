@@ -314,6 +314,34 @@ def _prepare_messages_for_model(
     return prepared
 
 
+def _extract_thinking_content(text: str) -> tuple[str, str]:
+    """
+    Extract thinking content from text and return (thinking_content, remaining_text).
+    Thinking content is identified by <think>...</think> tags.
+    """
+    if not text:
+        return "", text
+
+    thinking_parts: list[str] = []
+    remaining_parts: list[str] = []
+
+    # Split by <think> tags
+    parts = re.split(r'(<think>.*?</think>)', text, flags=re.DOTALL)
+
+    for part in parts:
+        if part.startswith('<think>') and part.endswith('</think>'):
+            # Extract content between tags
+            thinking_content = part[7:-8]  # Remove <think> and </think>
+            thinking_parts.append(thinking_content)
+        elif part:
+            remaining_parts.append(part)
+
+    thinking_text = ''.join(thinking_parts)
+    remaining_text = ''.join(remaining_parts)
+
+    return thinking_text.strip(), remaining_text.strip()
+
+
 def _strip_system_hints(text: str) -> str:
     """Remove system-level hint text from a given string."""
     if not text:
@@ -676,8 +704,23 @@ async def create_chat_completion(
     storage_output = _remove_tool_call_blocks(raw_output_clean).strip()
     tool_calls_payload = [call.model_dump(mode="json") for call in tool_calls]
 
+    # Handle thinking/reasoning content based on configuration
+    thinking_output_mode = g_config.thinking.output
+    thinking_content = ""
+    final_content = visible_output
+
+    if thinking_output_mode == "filter":
+        # Remove thinking content completely (extract and discard)
+        _, final_content = _extract_thinking_content(visible_output)
+    elif thinking_output_mode == "reasoning_content":
+        # Extract thinking content separately
+        thinking_content, final_content = _extract_thinking_content(visible_output)
+    # elif thinking_output_mode == "raw":
+    #     # Keep thinking content in the output (do nothing, use visible_output as-is)
+    #     pass
+
     if structured_requirement:
-        cleaned_visible = _strip_code_fence(visible_output or "")
+        cleaned_visible = _strip_code_fence(final_content or "")
         if not cleaned_visible:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
@@ -696,7 +739,7 @@ async def create_chat_completion(
             ) from exc
 
         canonical_output = json.dumps(structured_payload, ensure_ascii=False)
-        visible_output = canonical_output
+        final_content = canonical_output
         storage_output = canonical_output
 
     if tool_calls_payload:
@@ -727,7 +770,8 @@ async def create_chat_completion(
     timestamp = int(datetime.now(tz=timezone.utc).timestamp())
     if request.stream:
         return _create_streaming_response(
-            visible_output,
+            final_content,
+            thinking_content,
             tool_calls_payload,
             completion_id,
             timestamp,
@@ -736,7 +780,8 @@ async def create_chat_completion(
         )
     else:
         return _create_standard_response(
-            visible_output,
+            final_content,
+            thinking_content,
             tool_calls_payload,
             completion_id,
             timestamp,
@@ -885,7 +930,8 @@ async def create_response(
 
     visible_text, detected_tool_calls = _extract_tool_calls(text_with_think)
     storage_output = _remove_tool_call_blocks(text_without_think).strip()
-    assistant_text = LMDBConversationStore.remove_think_tags(visible_text.strip())
+    # Remove all <think> tags from visible text (not just at the start)
+    _, assistant_text = _extract_thinking_content(visible_text.strip())
 
     if structured_requirement:
         cleaned_visible = _strip_code_fence(assistant_text or "")
@@ -1201,6 +1247,7 @@ def _iter_stream_segments(model_output: str, chunk_size: int = 64):
 
 def _create_streaming_response(
     model_output: str,
+    thinking_content: str,
     tool_calls: list[dict],
     completion_id: str,
     created_time: int,
@@ -1212,7 +1259,7 @@ def _create_streaming_response(
     # Calculate token usage
     prompt_tokens = sum(estimate_tokens(_text_from_message(msg)) for msg in messages)
     tool_args = "".join(call.get("function", {}).get("arguments", "") for call in tool_calls or [])
-    completion_tokens = estimate_tokens(model_output + tool_args)
+    completion_tokens = estimate_tokens(model_output + thinking_content + tool_args)
     total_tokens = prompt_tokens + completion_tokens
     finish_reason = "tool_calls" if tool_calls else "stop"
 
@@ -1226,6 +1273,18 @@ def _create_streaming_response(
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
         yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
+
+        # Stream thinking/reasoning content if present
+        if thinking_content:
+            for chunk in _iter_stream_segments(thinking_content):
+                data = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_time,
+                    "model": model,
+                    "choices": [{"index": 0, "delta": {"reasoning_content": chunk}, "finish_reason": None}],
+                }
+                yield f"data: {orjson.dumps(data).decode('utf-8')}\n\n"
 
         # Stream output text in chunks for efficiency
         for chunk in _iter_stream_segments(model_output):
@@ -1356,6 +1415,7 @@ def _create_responses_streaming_response(
 
 def _create_standard_response(
     model_output: str,
+    thinking_content: str,
     tool_calls: list[dict],
     completion_id: str,
     created_time: int,
@@ -1366,11 +1426,20 @@ def _create_standard_response(
     # Calculate token usage
     prompt_tokens = sum(estimate_tokens(_text_from_message(msg)) for msg in messages)
     tool_args = "".join(call.get("function", {}).get("arguments", "") for call in tool_calls or [])
-    completion_tokens = estimate_tokens(model_output + tool_args)
+    completion_tokens = estimate_tokens(model_output + thinking_content + tool_args)
     total_tokens = prompt_tokens + completion_tokens
     finish_reason = "tool_calls" if tool_calls else "stop"
 
-    message_payload: dict = {"role": "assistant", "content": model_output or None}
+    message_payload: dict = {"role": "assistant"}
+
+    # Add reasoning_content first if present (DeepSeek style)
+    if thinking_content:
+        message_payload["reasoning_content"] = thinking_content
+
+    # Add regular content
+    message_payload["content"] = model_output or None
+
+    # Add tool calls if present
     if tool_calls:
         message_payload["tool_calls"] = tool_calls
 

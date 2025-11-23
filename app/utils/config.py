@@ -113,6 +113,20 @@ class LoggingConfig(BaseModel):
     )
 
 
+class ThinkingConfig(BaseModel):
+    """Thinking/reasoning output configuration"""
+
+    output: Literal["filter", "reasoning_content", "raw"] = Field(
+        default="filter",
+        description=(
+            "How to handle thinking/reasoning content: "
+            "'filter' - remove thinking content (default), "
+            "'reasoning_content' - output to reasoning_content field (DeepSeek style), "
+            "'raw' - include thinking content in regular content field"
+        ),
+    )
+
+
 class Config(BaseSettings):
     """Application configuration"""
 
@@ -140,6 +154,12 @@ class Config(BaseSettings):
     logging: LoggingConfig = Field(
         default=LoggingConfig(),
         description="Logging configuration",
+    )
+
+    # Thinking/reasoning output configuration
+    thinking: ThinkingConfig = Field(
+        default=ThinkingConfig(),
+        description="Thinking/reasoning output configuration",
     )
 
     model_config = SettingsConfigDict(

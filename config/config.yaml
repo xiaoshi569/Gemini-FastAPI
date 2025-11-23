@@ -35,3 +35,9 @@ storage:
 
 logging:
   level: "INFO"           # Log level: DEBUG, INFO, WARNING, ERROR
+
+thinking:
+  output: "filter"         # How to handle thinking/reasoning content:
+                           # - "filter": Remove thinking content completely (default)
+                           # - "reasoning_content": Output to reasoning_content field (DeepSeek style)
+                           # - "raw": Include thinking content in regular content field
